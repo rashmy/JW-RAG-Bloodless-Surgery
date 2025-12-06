@@ -1,121 +1,113 @@
-# JW-RAG-Bloodless-Surgery
-RAG-based assistant for bloodless surgery using JW Medical Library documents.
+import streamlit as st 
+from langchain_community.document_loaders import DirectoryLoader 
+from langchain_text_splitters import RecursiveCharacterTextSplitter 
+from langchain_huggingface import HuggingFaceEmbeddings 
+from langchain_community.vectorstores import FAISS 
+from langchain_community.llms import Ollama 
+from langchain_core.prompts import PromptTemplate 
+# ------------------------------- 
+# 1. Load & Prepare Vector Store 
+# ------------------------------- 
 
-# 1. Extract PDF
-import os
-from pypdf import PdfReader
+DATA_FOLDER = "D:/JW_RAG_Project/data_raw" 
 
-data_dir = r"D:\JW_RAG_Project\data_raw"
+@st.cache_resource 
+def load_vectorstore(): 
+   loader = DirectoryLoader(DATA_FOLDER, glob="*.txt") 
+   documents = loader.load() 
 
-for file in os.listdir(data_dir):
-    if file.lower().endswith(".pdf"):
-        pdf_path = os.path.join(data_dir, file)
-        txt_path = pdf_path.replace(".pdf", ".txt")
+   text_splitter = RecursiveCharacterTextSplitter( 
+   chunk_size=256, 
+   chunk_overlap=50 
+   ) 
+   chunks = text_splitter.split_documents(documents) 
+   
+   embeddings = HuggingFaceEmbeddings( 
+     model_name="sentence-transformers/all-MiniLM-L6-v2" 
+   ) 
 
-        try:
-            print("Extracting:", pdf_path)
-            reader = PdfReader(pdf_path)
-            text = "\n".join(page.extract_text() or "" for page in reader.pages)
+   vectorstore = FAISS.from_documents(chunks, embeddings) 
+   return vectorstore.as_retriever(k=5) 
 
-            with open(txt_path, "w", encoding="utf-8") as f:
-                f.write(text)
+retriever = load_vectorstore() 
+# ------------------------------- 
+# 2. Initialize LLM & Prompt 
+# ------------------------------- 
 
-            print("Saved:", txt_path)
+llm = Ollama( 
+  model="jw", 
+  temperature=0.1 
+) 
 
-        except Exception as e:
-            print("Error:", file, "->", e)
+prompt = PromptTemplate( 
+  template=""" 
+You are an AI assistant. Answer the question using ONLY the context below. 
+Do NOT use your own knowledge. 
 
-# 2. Lightweight cleaning
-def clean_text(t):
-    t = t.replace("\n", " ")
-    t = t.replace("\t", " ")
-    while "  " in t:
-        t = t.replace("  ", " ")
-    return t.strip()
+Context: 
+{context} 
 
-# 3. Chunk text
-from pathlib import Path
+Question: 
+{question} 
 
-def chunk_text(text, max_len=500):
-    words = text.split()
-    chunks = []
+If not found in the context, say "I don't know". 
+""", 
+  input_variables=["context", "question"] 
+) 
 
-    for i in range(0, len(words), max_len):
-        chunk = " ".join(words[i:i+max_len])
-        chunks.append(chunk)
+chain = prompt | llm 
 
-    return chunks
+# ------------------------------- 
+# 3. Streamlit UI 
+# ------------------------------- 
 
-txt_files = list(Path(data_dir).glob("*.txt"))
+st.set_page_config(page_title="JW RAG Chatbot Evaluation", layout="centered") 
+st.title("📘 JW Bloodless Medicine — RAG Chatbot Evaluation") 
 
-documents = []
+st.write("Test your chatbot with multiple questions and see retrieval + answer accuracy.") 
 
-for f in txt_files:
-    content = clean_text(open(f, encoding="utf-8").read())
-    chunks = chunk_text(content)
-    for c in chunks:
-        documents.append(c)
+if "results" not in st.session_state: 
+  st.session_state.results = [] 
 
-print("Total chunks:", len(documents))
+# Input box for multiple questions 
+question = st.text_input("Enter your question:", "") 
 
-# 4. Load ChromaDB & SentenceTransformer
-import chromadb
-from sentence_transformers import SentenceTransformer
+expected_answer = st.text_input("Expected answer (for evaluation, optional):", "") 
 
-client = chromadb.PersistentClient(path=r"D:\JW_RAG_Project\chroma_db")
+if st.button("Test Question"): 
+  if question: 
+  # Retrieve chunks 
+  docs = retriever.invoke(question) 
+  context = "\n\n".join([d.page_content for d in docs]) 
+  retrieved_ids = [str(i) for i in range(len(docs))] 
 
-collection = client.get_or_create_collection(
-    name="jw_bloodless",
-    metadata={"hnsw:space": "cosine"}
-)
+  # Generate answer 
+  answer = chain.invoke({"context": context, "question": question}) 
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
+  # Simple scoring: check if expected answer is in generated answer answer_correct = 0 
+  if expected_answer.strip() != "": 
+     answer_correct = int(expected_answer.lower() in answer.lower()) 
 
-# 5. Insert chunks into ChromaDB
-ids = [str(i) for i in range(len(documents))]
+  # Store results 
+  st.session_state.results.append({ 
+    "question": question, 
+    "expected_answer": expected_answer, 
+    "generated_answer": answer, 
+    "retrieved_chunks": len(docs), 
+    "answer_correct": answer_correct }) 
 
-collection.add(
-    ids=ids,
-    documents=documents
-)
+# Display results 
+if st.session_state.results: 
+   st.markdown("### Test Results") 
+   for i, r in enumerate(st.session_state.results): 
+     st.markdown(f"**Q{i+1}:** {r['question']}") 
+     if r['expected_answer']: 
+       st.markdown(f"**Expected:** {r['expected_answer']}") 
+     st.markdown(f"**Generated:** {r['generated_answer']}") 
+     st.markdown(f"**Chunks Retrieved:** {r['retrieved_chunks']}") 
+     if r['expected_answer']: 
+       st.markdown(f"**Answer Correct:** {r['answer_correct']}") 
+     st.markdown("---") 
 
-print("Inserted into ChromaDB:", len(ids))
 
-# 6. Query RAG
-def rag_query(question, k=3):
-    results = collection.query(
-        query_texts=[question],
-        n_results=k
-    )
-    return results["documents"][0]
 
-query = "What are the ethical considerations in bloodless surgery?"
-
-answers = rag_query(query)
-
-for i, ans in enumerate(answers, 1):
-    print(f"\n--- Result {i} ---\n{ans[:500]}\n")
-
-# 7. Streamlit Web App
-import streamlit as st
-import chromadb
-from sentence_transformers import SentenceTransformer
-
-client = chromadb.PersistentClient(path=r"D:\JW_RAG_Project\chroma_db")
-
-collection = client.get_or_create_collection("jw_bloodless")
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
-st.title("JW Bloodless Surgery Assistant")
-
-query = st.text_input("Ask a question:")
-
-if query:
-    results = collection.query(
-        query_texts=[query],
-        n_results=3
-    )
-
-    st.subheader("Top Retrieved Chunks:")
-    for doc in results["documents"][0]:
-        st.write(doc[:500] + "...")
