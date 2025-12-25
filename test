@@ -1,0 +1,209 @@
+# Test File
+
+import torch
+torch.nn.Module.to_empty = torch.nn.Module.to
+
+
+import streamlit as st
+from langchain_community.document_loaders import DirectoryLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain_community.llms import Ollama
+from langchain_core.prompts import PromptTemplate
+from sentence_transformers import SentenceTransformer
+
+
+# Semantic model for similarity checking
+semantic_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2", device="cpu")
+
+
+# -------------------------------
+# 1. Load & Prepare Vector Store
+# -------------------------------
+
+DATA_FOLDER = "D:/JW_RAG_Project/data_raw"
+
+@st.cache_resource
+def load_vectorstore():
+    loader = DirectoryLoader(DATA_FOLDER, glob="*.txt")
+    documents = loader.load()
+
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=256,
+        chunk_overlap=50
+    )
+    chunks = text_splitter.split_documents(documents)
+
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2",
+        model_kwargs={"device": "cpu"}
+    )
+
+    vectorstore = FAISS.from_documents(chunks, embeddings)
+    return vectorstore.as_retriever(k=5)
+
+retriever = load_vectorstore()
+
+# -------------------------------
+# 2. Initialize LLM & Prompt
+# -------------------------------
+
+llm = Ollama(
+    model="jw",
+    temperature=0.1
+)
+
+prompt = PromptTemplate(
+    template="""
+You are an AI assistant. Answer the question using ONLY the context below.
+Do NOT use your own knowledge.
+
+Context:
+{context}
+
+Question:
+{question}
+
+If not found in the context, say "I don't know".
+""",
+    input_variables=["context", "question"]
+)
+
+chain = prompt | llm
+
+from sklearn.metrics.pairwise import cosine_similarity
+from sentence_transformers import SentenceTransformer
+import numpy as np
+import time
+# -------------------------------
+# Evaluation Functions
+# -------------------------------
+def compute_semantic_similarity(expected, generated):
+    if not expected.strip() or not generated.strip():
+        return 0.0
+    try:
+        emb1 = semantic_model.encode([expected])
+        emb2 = semantic_model.encode([generated])
+        score = cosine_similarity(emb1, emb2)[0][0]
+        return float(score)
+    except:
+        return 0.0
+
+def compute_faithfulness(answer, context):
+    sentences = [s.strip() for s in answer.split(".") if len(s.strip()) > 5]
+    if not sentences:
+        return 0
+    matches = 0
+    for s in sentences:
+        if s.lower() in context.lower():
+            matches += 1
+    return matches / len(sentences)
+
+def repetition_penalty(answer):
+    words = answer.lower().split()
+    if len(words) < 5:
+        return 0
+    unique_words = set(words)
+    return 1 - (len(unique_words) / len(words))
+
+
+# -------------------------------
+# 3. Streamlit UI
+# -------------------------------
+
+st.set_page_config(page_title="JW RAG Chatbot Evaluation", layout="centered")
+st.title("📘 JW Bloodless Medicine — RAG Chatbot Evaluation")
+
+st.write("Test your chatbot with multiple questions and see retrieval + answer accuracy.")
+
+if "results" not in st.session_state:
+    st.session_state.results = []
+
+# Input box for multiple questions
+question = st.text_input("Enter your question:", "")
+
+expected_answer = st.text_input("Expected answer (for evaluation, optional):", "")
+
+if st.button("Test Question"):
+    if question:
+        start_t = time.time()
+
+        # Retrieve chunks
+        docs = retriever.invoke(question)
+        context = "\n\n".join([d.page_content for d in docs])
+        
+        # LLM Output
+        answer = chain.invoke({"context": context, "question": question})
+        
+        end_t = time.time()
+        response_time = end_t - start_t
+
+        # Evaluation Metrics
+        retrieval_correct = 0
+        if expected_answer:
+            retrieval_correct = int(expected_answer.lower() in context.lower())
+
+        exact_match = 0
+        if expected_answer:
+            exact_match = int(expected_answer.lower() in answer.lower())
+
+        semantic_score = compute_semantic_similarity(expected_answer, answer) if expected_answer else 0
+        
+        faithfulness_score = compute_faithfulness(answer, context)
+        repeat_score = repetition_penalty(answer)
+
+        # Store results
+        st.session_state.results.append({
+            "question": question,
+            "expected_answer": expected_answer,
+            "generated_answer": answer,
+            "retrieved_chunks": len(docs),
+            "retrieval_correct": retrieval_correct,
+            "exact_match": exact_match,
+            "semantic_score": semantic_score,
+            "faithfulness_score": faithfulness_score,
+            "repetition_penalty": repeat_score,
+            "response_time": response_time
+        })
+
+
+# Display results
+if st.session_state.results:
+    st.markdown("### Test Results")
+    for i, r in enumerate(st.session_state.results):
+        st.markdown(f"**Q{i+1}:** {r['question']}")
+
+        if r['expected_answer']:
+            st.markdown(f"**Expected:** {r['expected_answer']}")
+
+        st.markdown(f"**Generated:** {r['generated_answer']}")
+        st.markdown(f"**Chunks Retrieved:** {r['retrieved_chunks']}")
+        st.markdown(f"**Retrieval Correct (R@5):** {r['retrieval_correct']}")
+        st.markdown(f"**Exact Match:** {r['exact_match']}")
+        st.markdown(f"**Semantic Similarity:** {r['semantic_score']:.2f}")
+        st.markdown(f"**Faithfulness Score:** {r['faithfulness_score']:.2f}")
+        st.markdown(f"**Repetition Penalty:** {r['repetition_penalty']:.2f}")
+        st.markdown(f"**Response Time:** {r['response_time']:.2f} sec")
+        st.markdown("---")
+
+    # Aggregate Metrics
+    st.markdown("## Overall Evaluation Summary")
+
+    total = len([r for r in st.session_state.results if r['expected_answer']])
+
+    if total > 0:
+        avg_exact = np.mean([r['exact_match'] for r in st.session_state.results])
+        avg_retrieval = np.mean([r['retrieval_correct'] for r in st.session_state.results])
+        avg_semantic = np.mean([r['semantic_score'] for r in st.session_state.results])
+        avg_faith = np.mean([r['faithfulness_score'] for r in st.session_state.results])
+        avg_repeat = np.mean([r['repetition_penalty'] for r in st.session_state.results])
+        avg_time = np.mean([r['response_time'] for r in st.session_state.results])
+
+        st.markdown(f"**Overall Retrieval Accuracy (R@5):** {avg_retrieval:.2f}")
+        st.markdown(f"**Overall Exact Match Accuracy:** {avg_exact:.2f}")
+        st.markdown(f"**Overall Semantic Accuracy:** {avg_semantic:.2f}")
+        st.markdown(f"**Overall Faithfulness:** {avg_faith:.2f}")
+        st.markdown(f"**Average Repetition Score:** {avg_repeat:.2f}")
+        st.markdown(f"**Average Response Time:** {avg_time:.2f} sec")
+
