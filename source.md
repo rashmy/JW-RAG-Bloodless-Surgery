@@ -1,3 +1,5 @@
+#source code
+
 from langchain_community.document_loaders import DirectoryLoader  # type: ignore
 from langchain_text_splitters import RecursiveCharacterTextSplitter  # type: ignore
 from langchain_huggingface import HuggingFaceEmbeddings  # type: ignore
